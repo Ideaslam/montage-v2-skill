@@ -1,105 +1,151 @@
 ---
 name: rough-cut
-description: Turn a folder of raw video footage into an editable Adobe Premiere Pro rough cut. Analyzes the clips (transcript, snapshots, key scenes), writes a timeline CSV and a structured summary, generates a Premiere-importable XML sequence, cleans the audio (Adobe Podcast Enhance Speech or an ffmpeg fallback), and exports only after the user approves. Use when the user asks to analyze footage, build a montage or rough cut, or prepare a Premiere timeline from a folder of videos.
+description: Turn a folder of raw video footage into a finished, social-ready video with an editable Adobe Premiere Pro timeline. Part 1 analyzes the clips (transcript, snapshots, key scenes), proposes an edit, writes a timeline CSV and a Premiere-importable XML, and cleans the audio. Part 2 adds effects (styled subtitles, B-roll, transitions, punch-in zooms with sound effects, color correction and skin smoothing). Part 3 renders a high-quality export. Every edit and the export need the user's approval. Use when the user asks to analyze footage, build a montage or rough cut, edit a talking-head/social video, or prepare a Premiere timeline from a folder of videos.
 argument-hint: <path-to-footage-folder>
 ---
 
-# rough-cut: footage → Premiere rough cut
+# rough-cut: footage → edited, social-ready video
+
+The plain-language version of this flow is `docs/m-video/note.md`. If the user changes the note, update this skill to match it.
 
 Footage folder: `$ARGUMENTS`. If it is empty, ask the user for the folder path before doing anything else.
 
 ## Ground rules
 
-- **Approval gates:** stop and wait for the user's explicit "yes" at every step marked **[APPROVAL]**. Never modify, overwrite or delete the user's original media. All outputs go in `<footage-folder>/_rough-cut/`.
-- **Limits:** you cannot see video or hear audio directly. You "watch" through extracted frames (open them with the Read tool) and "listen" through a transcript. You cannot open or control Premiere Pro. You produce files the user imports.
-- **Progress:** after each step, report in 1–3 lines what you produced and where.
+- **✋ = approval gate:** stop and wait for the user's explicit OK. The user's rule: *always take my approval before any edits.*
+- Never modify, overwrite or delete the user's original media. All outputs go in `<footage-folder>/_rough-cut/`.
+- **Limits:** you cannot see video or hear audio directly. You "watch" through extracted frames (open them with the Read tool) and "listen" through a transcript. You cannot control Premiere Pro. You produce files that the user imports.
+- **What Premiere can and can't import:** a Final Cut Pro 7 XML carries cuts, cross-dissolve transitions, scale/position keyframes (zooms), and extra audio tracks (SFX, clean audio) into Premiere. It does **not** carry Lumetri color or styled/animated captions. Those are built with ffmpeg and burned into the final render (Part 3). Tell the user this once, at the start of Part 2.
+- After each step, report in 1–3 lines what you made and where.
 
-## Step 0: Check tools
+---
 
-Run `which ffmpeg ffprobe` and check for a transcriber (`whisper`, `whisper-cli` / whisper.cpp, or `mlx_whisper`).
-If any are missing, tell the user what is missing and propose the install command (macOS: `brew install ffmpeg`, `pip install -U openai-whisper`). **[APPROVAL]** Ask before installing anything.
+# PART 1: Rough cut
 
-**Check that Premiere Pro is ready:**
-- Installed? macOS: `ls -d /Applications/Adobe\ Premiere\ Pro*/Adobe\ Premiere\ Pro*.app 2>/dev/null`. Windows: `dir "C:\Program Files\Adobe\Adobe Premiere Pro*"`. Report the version found (taken from the folder name, e.g. `Adobe Premiere Pro 2025`).
-- Running? macOS: `pgrep -fl "Adobe Premiere Pro"`. Windows: `tasklist | findstr /i "Adobe Premiere Pro.exe"`.
-- If it is not installed, tell the user. The analysis, CSV, summary and XML steps still work, but they will need Premiere (or another editor that imports FCP7 XML, e.g. DaVinci Resolve) to open the timeline. Ask whether to continue.
-- If it is installed but not running, say so; it does not need to be open until Step 6.
+## 1. Check tools
+- `which ffmpeg ffprobe`, plus a transcriber (`whisper`, `whisper-cli`, or `mlx_whisper`).
+- Premiere installed? macOS: `ls -d /Applications/Adobe\ Premiere\ Pro*/Adobe\ Premiere\ Pro*.app 2>/dev/null`. Windows: `dir "C:\Program Files\Adobe\Adobe Premiere Pro*"`. Running? `pgrep -fl "Adobe Premiere Pro"` (Windows: `tasklist | findstr /i "Premiere"`).
+- If ffmpeg or Whisper is missing, propose `brew install ffmpeg` / `pip install -U openai-whisper`. ✋ Ask before installing.
+- If Premiere is missing, say so. Everything still works except opening the XML (DaVinci Resolve can also import it). Ask whether to continue.
 
-## Step 1: Read the resources
+## 2. Read the videos
+List the media (`.mp4 .mov .mxf .m4v .wav .mp3 .m4a`, any case). For each file:
+`ffprobe -v error -show_entries format=duration:stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels -of json "<file>"`
+Save the results to `_rough-cut/media_info.json`. The main frame rate and resolution define the sequence.
 
-List the media in the folder (`.mp4 .mov .mxf .m4v .wav .mp3 .m4a`, case-insensitive). For each file, run:
-
-```
-ffprobe -v error -show_entries format=duration:stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels -of json "<file>"
-```
-
-Save the results to `_rough-cut/media_info.json`. Note the dominant frame rate and resolution: the sequence will use them.
-
-## Step 2: Extract sound and snapshots
-
-For each video:
-- Audio: `ffmpeg -i "<file>" -vn -ac 1 -ar 16000 "_rough-cut/audio/<name>.wav"` (16 kHz mono for transcription). Keep a full-quality copy too: `-vn -c:a pcm_s24le "_rough-cut/audio/<name>_full.wav"`.
-- Snapshots: one frame every N seconds (N = 5 for clips under 5 min, otherwise 15) plus scene changes:
+## 3. Extract sound and snapshots
+- Audio for transcription: `ffmpeg -i "<file>" -vn -ac 1 -ar 16000 "_rough-cut/audio/<name>.wav"`
+- Full-quality audio: `ffmpeg -i "<file>" -vn -c:a pcm_s24le "_rough-cut/audio/<name>_full.wav"`
+- Snapshots (N = 5 s for clips under 5 min, otherwise 15 s, plus scene changes):
   `ffmpeg -i "<file>" -vf "select='gt(scene,0.35)+not(mod(t\,N))',scale=640:-2" -vsync vfr -frame_pts 1 "_rough-cut/frames/<name>_%06d.jpg"`
-  Record each frame's timestamp, which you need for the CSV.
+  Keep each frame's timestamp.
 
-## Step 3: Transcribe and analyze
+## 4. Understand the videos
+- Transcribe with word-level timestamps; the subtitles in Part 2 need them: `whisper "<wav>" --model small --word_timestamps True --output_format all --output_dir _rough-cut/transcripts` (set `--language` if known).
+- Read a sample of about 20–40 snapshots per clip.
+- For each clip, find: the topic, the speakers, the key moments, strong quotes, bad takes, silences, and B-roll candidates.
 
-- Transcribe each audio file with timestamps (e.g. `whisper "<wav>" --model small --output_format srt --output_dir _rough-cut/transcripts`). Use the language the user speaks if it is known.
-- Open a representative set of snapshots with Read (not every frame: sample about 20–40 per clip).
-- From the frames and transcripts, identify for each clip: what it shows, the speakers, the key moments, strong quotes, bad takes or silences, and the B-roll candidates.
+## 5. Summary and proposed edit
+Write `_rough-cut/summary.md`: an overview, the main points, the key scenes and quotes with timecodes, the metadata, and a **proposed edit** (ordered segments and why).
+✋ Show it and wait for approval or changes.
 
-## Step 4: Summarize
+## 6. Timeline CSV
+Write `_rough-cut/timeline.csv` in the approved order:
+`order,clip_file,source_in,source_out,record_in,record_out,duration,track,type,description,dialogue,notes`
+Timecodes are `HH:MM:SS:FF` at the sequence fps. `type` is `a-roll | b-roll | music | title | sfx`.
 
-Write `_rough-cut/summary.md` with:
-- A one-paragraph overview of what the footage is about
-- The main points and insights
-- Key scenes (clip, in/out timecode, description)
-- Key dialogue/quotes with timecodes
-- Metadata (files, durations, fps, resolution, audio format)
-- **A proposed edit**: the ordered list of segments for the rough cut and why
+## 7. Premiere timeline
+- Write `_rough-cut/sequence.xml` (FCP7 XML, `xmeml version="4"`) from the CSV: one `<sequence>` with the fps and resolution from step 2 (`<ntsc>TRUE</ntsc>` for 23.976/29.97/59.94), one `<clipitem>` per row with `<in>/<out>` (source frames) and `<start>/<end>` (sequence frames), and linked audio. Each `<file>` has `<pathurl>` = `file://` + the absolute, URL-encoded path.
+- Check that it is well-formed: `python3 -c "import xml.dom.minidom,sys;xml.dom.minidom.parse(sys.argv[1])" _rough-cut/sequence.xml`
+- If Premiere is not running: ✋ offer to open it (`open -a "<app path>"`), and wait until the user has a project open.
+- User: *File → Import → sequence.xml*. Ask them to confirm that nothing is offline (if something is, they use *Link Media*).
 
-Show the user the summary and the proposed edit. **[APPROVAL]** Wait for approval or changes before building the timeline.
+## 8. Clean the sound
+✋ Ask first, and say which method you will use:
+- **Adobe Podcast Enhance Speech (best):** use an Adobe connector speech-enhance tool (e.g. `media_enhance_speech`) if one is available. This uploads audio to Adobe, so confirm first. Otherwise, the user processes the `_full.wav` files at https://podcast.adobe.com/enhance.
+- **Local ffmpeg:** `-af "highpass=f=80,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11"`
 
-## Step 5: Build the timeline CSV
+Save the results to `_rough-cut/audio_clean/<name>_clean.wav`. Update the XML so that it uses the clean audio (keep the original muted on a lower track).
 
-Write `_rough-cut/timeline.csv` with one row per segment in the approved order:
+## 9. Approve the cut
+Recap: clip count, total length, the audio method, and the file paths.
+If the user changed the edit in Premiere, ask them to export *File → Export → Final Cut Pro XML*, then update `timeline.csv` from it. Part 2 must start from their latest cut.
+✋ Wait for "the cut is OK" before Part 2.
 
-```
-order,clip_file,source_in,source_out,record_in,record_out,duration,track,type,description,dialogue,notes
-```
+---
 
-- Timecodes are `HH:MM:SS:FF` at the sequence frame rate. `record_in`/`record_out` are positions on the sequence.
-- `type` is one of `a-roll`, `b-roll`, `music`, `title`.
+# PART 2: Effects
 
-## Step 6: Generate the Premiere timeline
+For every effect: propose the plan first (what, where, timecodes), then ✋ wait for approval. Where it helps, show a preview (a still frame, or a 3–5 s test clip rendered to `_rough-cut/previews/`). Record every effect in `_rough-cut/effects.csv`:
+`order,effect,start,end,settings,sfx_file,notes`
 
-Write `_rough-cut/sequence.xml` in **Final Cut Pro 7 XML (xmeml v4)** format, which Premiere imports natively, built from `timeline.csv`:
-- One `<sequence>` with the frame rate and resolution from Step 1 (`<timebase>`, `<ntsc>TRUE</ntsc>` for 23.976/29.97/59.94).
-- One `<clipitem>` per row on V1 (and the linked A1/A2 audio), with `<in>`/`<out>` (source frames) and `<start>`/`<end>` (sequence frames).
-- Each `<file>` has a `<pathurl>` of `file://` plus the **absolute, URL-encoded** path to the original media, and declares its own duration/rate so Premiere can relink.
-- Validate that the XML is well-formed (`python3 -c "import xml.dom.minidom,sys;xml.dom.minidom.parse(sys.argv[1])" _rough-cut/sequence.xml`).
+**Sound effects:** ask the user for a folder of SFX (whoosh, pop, swoosh…). If they don't have one, offer to find some with a sound-effect connector if available, or skip the SFX. Place each SFX on its own audio track (A3+) in the XML, at about -12 dB under the voice.
 
-Before handing off, check again that Premiere is running (`pgrep -fl "Adobe Premiere Pro"`). If it is not, **[APPROVAL]** offer to launch it (macOS: `open -a "<app path found in Step 0>"`) and wait for the user to confirm that it is open and a project is loaded (Premiere imports into the open project).
+## 10. Subtitles
+✋ First ask the user to choose (offer 2–3 ready-made styles plus "custom"):
+- **Style:** e.g. word-by-word highlight (social style), 2-line classic, or a big single word
+- **Font** (it must be installed: `fc-list | grep -i "<font>"`), **size**, **text color**, **highlight color**, **outline/shadow**
+- **Position:** bottom, centre, or upper third (keep it clear of the platform UI on 9:16)
+- **Motion:** pop-in, fade, slide, or none
+- **SFX on subtitles:** none, on every line, or only on key words
 
-Tell the user: *Premiere Pro → File → Import → `sequence.xml`*. The sequence appears in the Project panel, ready to edit. Ask them to confirm that the import worked and that no clips show as offline (if any do, use *Link Media* and point to the original folder).
+Build the subtitles from the word timestamps (step 4), adjusted to the cut's `record_in` times. Write:
+- `_rough-cut/subtitles/subs.ass`: the styled and animated version for the render (ASS `\k` karaoke tags for highlighting, `\fad` / `\t(\fscx\fscy)` for pop motion)
+- `_rough-cut/subtitles/subs.srt`: a plain version the user can import in Premiere (*File → Import*) to edit the text
 
-## Step 7: Clean the audio
+Render a 5 s preview. ✋ Wait for approval. Also ask the user to check the spelling, especially names.
 
-**[APPROVAL]** Ask before processing audio, and say which method you will use:
-1. **Adobe Podcast Enhance Speech (preferred):** if an Adobe connector tool for speech enhancement (e.g. `media_enhance_speech`) is available, use it on the `_full.wav` files. This uploads audio to Adobe, so confirm with the user first. Otherwise, tell the user to run the files through https://podcast.adobe.com/enhance manually and put the results in `_rough-cut/audio_clean/`.
-2. **Local fallback (ffmpeg):** `ffmpeg -i in.wav -af "highpass=f=80,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11" out.wav`
+## 11. B-roll
+Only where it helps (long talking stretches, abstract topics, covering a jump cut). Use B-roll candidates from the footage first. If something is missing, list the shots you suggest and ask the user for files. Don't invent or generate footage without asking.
+✋ Show the list (timecode, which B-roll, why). Once approved, add the B-roll on V2 in the XML and the CSV.
 
-Save the cleaned files as `_rough-cut/audio_clean/<name>_clean.wav`. Regenerate `sequence.xml` so the audio tracks point to the cleaned files (keep the original audio muted on a lower track for reference).
+## 12. Transitions
+Use them only between some clips (scene or topic changes), not on every cut. Use cross dissolve or dip-to-black, 8–15 frames. Put them in the XML as `<transitionitem>`; for the render use ffmpeg `xfade`.
+✋ Show the list of transition points.
 
-## Step 8: Review before export
+## 13. Zoom in / zoom out
+On important moments or important lines (from the step 4 analysis): a punch-in to 110–120 % scale, either quick (3–6 frames, with a whoosh SFX) or a slow push. Zoom back out at the end of the moment. Put them in the XML as Basic Motion scale keyframes; for the render use ffmpeg `zoompan` / `scale+crop` on that segment.
+✋ Show the list (timecode, the line said, zoom type, SFX).
 
-Give a short recap: segment count, total duration, the audio method used, and the file locations. **[APPROVAL]** Do not export until the user explicitly approves.
+## 14. Color
+✋ Show a before/after still for each clip.
+- **Correction:** exposure, contrast, white balance, and matching between clips. ffmpeg: `eq=brightness:contrast:saturation:gamma`, `colorbalance`, `colortemperature`, or a `.cube` LUT if the user has one (`lut3d`).
+- **Skin:** natural skin tones (don't push orange or red), plus gentle smoothing: `bilateral=sigmaS=4:sigmaR=0.08` or `hqdn3d=2:1:3:3` at low strength. Note: ffmpeg smooths the whole frame. For skin-only smoothing, tell the user to use Premiere Lumetri (HSL Secondary) or a beauty plugin, and offer to write the exact settings.
 
-Export options (ask which one the user wants):
-- **Premiere (recommended if the user edited there):** the user exports from Premiere themselves.
-- **ffmpeg render** of the approved CSV: trim each segment, concatenate, and mux in the cleaned audio, to `_rough-cut/export/final.mp4` (H.264 at the source resolution/fps, AAC 320k).
+---
 
-## Step 9: Update the CSV after the final export
+# PART 3: Render
 
-If the user edited in Premiere, ask them to export the final sequence as XML (*File → Export → Final Cut Pro XML*) and give you the path. Parse it and update `timeline.csv` to match the final cut (changed in/out points, order, removed or added clips). Write a short `_rough-cut/changelog.md` listing what changed from the proposed edit.
+## 15. Final export
+✋ **No export until the user says yes.** First ask:
+- Which platform? **9:16** (Reels/TikTok/Shorts), **16:9** (YouTube), **1:1 or 4:5** (feed). For a crop, keep the speaker's face centred (check against the snapshots).
+- Export it themselves from Premiere, or have Claude render with ffmpeg (which includes the burned-in subtitles and color)?
+
+**ffmpeg render settings (high quality, high bitrate, social-ready):**
+- Video: `-c:v libx264 -profile:v high -preset slow -crf 16 -maxrate 50M -bufsize 100M -pix_fmt yuv420p`, at the source fps (no conversion). For 4K, use `-maxrate 80M`.
+- Audio: `-c:a aac -b:a 320k -ar 48000`, loudness normalized to **-14 LUFS** (`loudnorm=I=-14:TP=-1:LRA=11`).
+- `-movflags +faststart`
+- Output: `_rough-cut/export/final_<ratio>.mp4`
+
+If the user exports from Premiere, give them the matching settings: H.264, High profile, VBR 2-pass, target 30–40 Mbps (1080p), AAC 320 kbps, 48 kHz.
+
+After the render, check it with ffprobe (duration, resolution, bitrate, audio present) and report the file path and size.
+
+## 16. Update the CSV
+If the user changed anything in Premiere: they export *File → Export → Final Cut Pro XML*, and you update `timeline.csv` and `effects.csv` to match.
+Write `_rough-cut/changelog.md`: what changed compared with the proposed edit and effects.
+
+---
+
+## Output files (`_rough-cut/`)
+| File | What it is |
+|---|---|
+| `summary.md` | the video overview + proposed edit |
+| `timeline.csv` | the clips in the edit |
+| `effects.csv` | every effect with its timecode and settings |
+| `sequence.xml` | the timeline for Premiere |
+| `audio_clean/` | the cleaned sound |
+| `subtitles/` | `subs.ass` (styled) + `subs.srt` (editable) |
+| `previews/` | test clips and stills for approvals |
+| `export/final_<ratio>.mp4` | the final video |
+| `changelog.md` | what changed after the user's edits |

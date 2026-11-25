@@ -97,6 +97,10 @@ Step 2 :
 1- Effects : 
     - Subtitle: 
        - take my decision in the style , font , color ,motion with sound effect .
+    
+   
+  - BRoll : 
+    - do BRoll if it need it . 
   - Transitions : 
     - do trasnsitions between some clips .
    - Zoom :
@@ -104,4 +108,9 @@ Step 2 :
  - Coloring : 
    - correction . 
    - skin tone smoothness and coloring .
-   - 
+
+Step 3: 
+    - Render : 
+          - High Quality . 
+          - High bit rate. 
+          - good for social media . 
